@@ -188,8 +188,8 @@ public:
     DWORD                   m_rvaFirstThunk;
 
     DWORD                   m_nForwarderChain;
-    LPCSTR                  m_pszOrig;
-    LPCSTR                  m_pszName;
+    PSTR                    m_pszOrig;
+    PSTR                    m_pszName;
 };
 
 class CImageImportName
@@ -205,8 +205,8 @@ public:
     WORD        m_nHint;
     ULONG       m_nOrig;
     ULONG       m_nOrdinal;
-    LPCSTR      m_pszOrig;
-    LPCSTR      m_pszName;
+    PSTR        m_pszOrig;
+    PSTR        m_pszName;
 };
 
 class CImage
@@ -329,7 +329,7 @@ static inline DWORD QuadAlign(DWORD a)
     return Align(a, 8);
 }
 
-static LPCSTR DuplicateString(_In_ LPCSTR pszIn)
+static LPSTR DuplicateString(_In_ LPCSTR pszIn)
 {
     if (pszIn == NULL) {
         return NULL;
@@ -360,7 +360,7 @@ static LPCSTR DuplicateString(_In_ LPCSTR pszIn)
 static VOID ReleaseString(_In_opt_ LPCSTR psz)
 {
     if (psz != NULL) {
-        delete[] psz;
+        delete[] (PSTR)psz;
     }
 }
 
@@ -1714,17 +1714,13 @@ BOOL CImage::Write(HANDLE hFile)
         m_nNextFileAddr = Max(m_SectionHeaders[n].PointerToRawData +
                               m_SectionHeaders[n].SizeOfRawData,
                               m_nNextFileAddr);
-#if 0
-        m_nNextVirtAddr = Max(m_SectionHeaders[n].VirtualAddress +
-                              m_SectionHeaders[n].Misc.VirtualSize,
-                              m_nNextVirtAddr);
-#else
+
+        // Old images have VirtualSize == 0 as a matter of course, e.g. NT 3.1.
         m_nNextVirtAddr = Max(m_SectionHeaders[n].VirtualAddress +
                               (m_SectionHeaders[n].Misc.VirtualSize
                                ? m_SectionHeaders[n].Misc.VirtualSize
                                : SectionAlign(m_SectionHeaders[n].SizeOfRawData)),
                               m_nNextVirtAddr);
-#endif
 
         m_nExtraOffset = Max(m_nNextFileAddr, m_nExtraOffset);
 

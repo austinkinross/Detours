@@ -833,13 +833,9 @@ inline void detour_find_jmp_bounds(PBYTE pbCode,
                                    PDETOUR_TRAMPOLINE *ppLower,
                                    PDETOUR_TRAMPOLINE *ppUpper)
 {
-    // We have to place trampolines within +/- 2GB of code.
-    ULONG_PTR lo = detour_2gb_below((ULONG_PTR)pbCode);
-    ULONG_PTR hi = detour_2gb_above((ULONG_PTR)pbCode);
-    DETOUR_TRACE(("[%p..%p..%p]\n", lo, pbCode, hi));
-
-    *ppLower = (PDETOUR_TRAMPOLINE)lo;
-    *ppUpper = (PDETOUR_TRAMPOLINE)hi;
+    (void)pbCode;
+    *ppLower = (PDETOUR_TRAMPOLINE)(ULONG_PTR)0x00080000;
+    *ppUpper = (PDETOUR_TRAMPOLINE)(ULONG_PTR)0xfff80000;
 }
 
 
@@ -879,7 +875,29 @@ inline ULONG detour_is_code_filler(PBYTE pbCode)
 struct _DETOUR_TRAMPOLINE
 {
     // An ARM64 instruction is 4 bytes long.
-    BYTE            rbCode[64];     // target code + jmp to pbRemain
+    //
+    // The overwrite is always 2 instructions plus a literal, so 16 bytes, 4 instructions.
+    //
+    // Copied instructions can expand.
+    //
+    // The scheme using MovImmediate can cause an instruction
+    // to grow as much as 6 times.
+    // That would be Bcc or Tbz with a large address space:
+    //   4 instructions to form immediate
+    //   inverted tbz/bcc
+    //   br
+    //
+    // An expansion of 4 is not uncommon -- bl/blr and small address space:
+    //   3 instructions to form immediate
+    //   br or brl
+    //
+    // A theoretical maximum for rbCode is thefore 4*4*6 + 16 = 112 (another 16 for jmp to pbRemain).
+    //
+    // With literals, the maximum expansion is 5, including the literals: 4*4*5 + 16 = 96.
+    //
+    // The number is rounded up to 128. m_rbScratchDst should match this.
+    //
+    BYTE            rbCode[128];    // target code + jmp to pbRemain
     BYTE            cbCode;         // size of moved target code.
     BYTE            cbCodeBreak[3]; // padding to make debugging easier.
     BYTE            rbRestore[24];  // original target code.
@@ -890,10 +908,10 @@ struct _DETOUR_TRAMPOLINE
     PBYTE           pbDetour;       // first instruction of detour function.
 };
 
-C_ASSERT(sizeof(_DETOUR_TRAMPOLINE) == 120);
+C_ASSERT(sizeof(_DETOUR_TRAMPOLINE) == 184);
 
 enum {
-    SIZE_OF_JMP = 8
+    SIZE_OF_JMP = 16
 };
 
 inline ULONG fetch_opcode(PBYTE pbCode)
@@ -915,7 +933,7 @@ PBYTE detour_gen_jmp_immediate(PBYTE pbCode, PBYTE *ppPool, PBYTE pbJmpVal)
         pbLiteral = *ppPool;
     }
     else {
-        pbLiteral = pbCode + 2*4;
+        pbLiteral = pbCode + 8;
     }
 
     *((PBYTE*&)pbLiteral) = pbJmpVal;
@@ -938,6 +956,15 @@ inline PBYTE detour_gen_brk(PBYTE pbCode, PBYTE pbLimit)
     return pbCode;
 }
 
+inline INT64 detour_sign_extend(UINT64 value, UINT bits)
+{
+    const UINT left = 64 - bits;
+    const INT64 m1 = -1;
+    const INT64 wide = (INT64)(value << left);
+    const INT64 sign = (wide < 0) ? (m1 << left) : 0;
+    return value | sign;
+}
+
 inline PBYTE detour_skip_jmp(PBYTE pbCode, PVOID *ppGlobals)
 {
     if (pbCode == NULL) {
@@ -958,11 +985,63 @@ inline PBYTE detour_skip_jmp(PBYTE pbCode, PVOID *ppGlobals)
 
             if (Opcode3 == 0xd61f0200) {                 // br    x16
 
-                ULONG PageOffset = ((Opcode & 0x60000000) >> 29) | ((Opcode & 0x00ffffe0) >> 3);
-                PageOffset = (LONG)(Opcode << 11) >> 11;
+/* https://static.docs.arm.com/ddi0487/bb/DDI0487B_b_armv8_arm.pdf
+    The ADRP instruction shifts a signed, 21-bit immediate left by 12 bits, adds it to the value of the program counter with
+    the bottom 12 bits cleared to zero, and then writes the result to a general-purpose register. This permits the
+    calculation of the address at a 4KB aligned memory region. In conjunction with an ADD (immediate) instruction, or
+    a Load/Store instruction with a 12-bit immediate offset, this allows for the calculation of, or access to, any address
+    within ±4GB of the current PC.
 
-                PBYTE pbTarget = (PBYTE)(((ULONG64)pbCode & 0xfffffffffffff000ULL) + PageOffset +
-                                         ((Opcode2 >> 10) & 0xfff));
+PC-rel. addressing
+    This section describes the encoding of the PC-rel. addressing instruction class. The encodings in this section are
+    decoded from Data Processing -- Immediate on page C4-226.
+    Add/subtract (immediate)
+    This section describes the encoding of the Add/subtract (immediate) instruction class. The encodings in this section
+    are decoded from Data Processing -- Immediate on page C4-226.
+    Decode fields
+    Instruction page
+    op
+    0 ADR
+    1 ADRP
+
+C6.2.10 ADRP
+    Form PC-relative address to 4KB page adds an immediate value that is shifted left by 12 bits, to the PC value to
+    form a PC-relative address, with the bottom 12 bits masked out, and writes the result to the destination register.
+    ADRP <Xd>, <label>
+    imm = SignExtend(immhi:immlo:Zeros(12), 64);
+
+    31  30 29 28 27 26 25 24 23 5    4 0
+    1   immlo  1  0  0  0  0  immhi  Rd
+         9             0
+
+Rd is hardcoded as 0x10 above.
+Immediate is 21 signed bits split into 2 bits and 19 bits, and is scaled by 4K.
+*/
+                UINT64 const pageLow2 = (Opcode >> 29) & 3;
+                UINT64 const pageHigh19 = (Opcode >> 5) & ~(~0ui64 << 19);
+                INT64 const page = detour_sign_extend((pageHigh19 << 2) | pageLow2, 21) << 12;
+
+/* https://static.docs.arm.com/ddi0487/bb/DDI0487B_b_armv8_arm.pdf
+
+    C6.2.101 LDR (immediate)
+    Load Register (immediate) loads a word or doubleword from memory and writes it to a register. The address that is
+    used for the load is calculated from a base register and an immediate offset.
+    The Unsigned offset variant scales the immediate offset value by the size of the value accessed before adding it
+    to the base register value.
+
+Unsigned offset
+64-bit variant Applies when size == 11.
+    31 30 29 28  27 26 25 24  23 22  21   10   9 5   4 0
+     1  x  1  1   1  0  0  1   0  1  imm12      Rn    Rt
+         F             9        4              200    10
+
+That is, two low 5 bit fields are registers, hardcoded as 0x10 and 0x10 << 5 above,
+then unsigned size-unscaled (8) 12-bit offset, then opcode bits 0xF94.
+*/
+                UINT64 const offset = ((Opcode2 >> 10) & ~(~0ui64 << 12)) << 3;
+
+                PBYTE const pbTarget = (PBYTE)((ULONG64)pbCode & 0xfffffffffffff000ULL) + page + offset;
+
                 if (detour_is_imported(pbCode, pbTarget)) {
                     PBYTE pbNew = *(PBYTE *)pbTarget;
                     DETOUR_TRACE(("%p->%p: skipped over import table.\n", pbCode, pbNew));
@@ -972,6 +1051,15 @@ inline PBYTE detour_skip_jmp(PBYTE pbCode, PVOID *ppGlobals)
         }
     }
     return pbCode;
+}
+
+inline void detour_find_jmp_bounds(PBYTE pbCode,
+                                   PDETOUR_TRAMPOLINE *ppLower,
+                                   PDETOUR_TRAMPOLINE *ppUpper)
+{
+    (void)pbCode;
+    *ppLower = (PDETOUR_TRAMPOLINE)(ULONG_PTR)0x0000000000080000;
+    *ppUpper = (PDETOUR_TRAMPOLINE)(ULONG_PTR)0xfffffffffff80000;
 }
 
 inline BOOL detour_does_code_end_function(PBYTE pbCode)
